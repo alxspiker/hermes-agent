@@ -3843,13 +3843,24 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if getattr(self, "_voice_mixers", None) is not None:
             self._voice_mixers.pop(guild_id, None)
         vc = self._voice_clients.pop(guild_id, None)
-        if vc and vc.is_connected():
-            try:
-                if vc.is_playing():
-                    vc.stop()
-            except Exception:
-                pass
-            await vc.disconnect()
+        if vc:
+            connected = vc.is_connected()
+            if connected:
+                try:
+                    if vc.is_playing():
+                        vc.stop()
+                except Exception:
+                    pass
+                await vc.disconnect()
+            else:
+                # discord.py retains guild voice clients across some failed
+                # voice reconnects. Merely popping our adapter dict strands
+                # channel.connect() on its old, disconnected client forever.
+                # Force disposal only for that already-dead transport.
+                try:
+                    await vc.disconnect(force=True)
+                except TypeError:
+                    await vc.disconnect()  # older implementations
         task = self._voice_timeout_tasks.pop(guild_id, None)
         if task:
             task.cancel()

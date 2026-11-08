@@ -95,3 +95,23 @@ async def test_explicit_manual_join_revokes_automation_ownership(monkeypatch):
     assert await adapter.join_voice_channel(channel, text_channel_id=10)
     assert 123 not in adapter._voice_owners
     adapter._join_voice_locked.assert_awaited_once_with(channel, 10, None)
+
+
+@pytest.mark.asyncio
+async def test_stale_voice_client_is_force_disconnected_before_rejoin(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    adapter._client = SimpleNamespace(get_guild=lambda _gid: None)
+    adapter._voice_receivers = {}
+    adapter._voice_listen_tasks = {}
+    adapter._voice_text_channels = {}
+    adapter._voice_sources = {}
+    adapter._voice_timeout_tasks = {}
+    adapter._voice_mixers = {}
+    stale = SimpleNamespace(
+        is_connected=lambda: False,
+        disconnect=AsyncMock(),
+    )
+    adapter._voice_clients[123] = stale
+    await adapter.leave_voice_channel(123)
+    stale.disconnect.assert_awaited_once_with(force=True)
+    assert 123 not in adapter._voice_clients
