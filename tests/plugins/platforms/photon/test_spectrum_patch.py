@@ -39,11 +39,22 @@ def _write_sidecar_fixture(tmp_path: Path, *, sdk_available: bool) -> Path:
     # index.mjs imports sibling helper modules — copy every non-patch .mjs so
     # the fixture keeps working as helpers are extracted from index.mjs.
     for helper in Path("plugins/platforms/photon/sidecar").glob("*.mjs"):
-        if helper.name in ("index.mjs", "patch-spectrum-mixed-attachments.mjs"):
+        if helper.name in (
+            "index.mjs",
+            "patch-spectrum-mixed-attachments.mjs",
+            "patch-spectrum-durable-cursors.mjs",
+        ):
             continue
         shutil.copyfile(helper, sidecar / helper.name)
     (sidecar / "patch-spectrum-mixed-attachments.mjs").write_text(
         "export function patchSpectrumTs() { throw new Error('forced patch failure'); }\n",
+        encoding="utf-8",
+    )
+    # Cursor durability is a required safety patch, unlike the optional legacy
+    # mixed-attachment patch. This fixture exercises only the latter failure,
+    # so provide a successful cursor-patch stub.
+    (sidecar / "patch-spectrum-durable-cursors.mjs").write_text(
+        "export function patchDurableCursors() { return {patched: false, file: 'fixture'}; }\n",
         encoding="utf-8",
     )
 

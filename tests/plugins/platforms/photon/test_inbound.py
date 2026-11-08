@@ -150,6 +150,155 @@ async def test_on_inbound_line_dispatches_and_dedups(
 
 
 @pytest.mark.asyncio
+async def test_on_inbound_line_acks_only_after_successful_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    order: list[str] = []
+
+    async def dispatch(_event: dict[str, Any]) -> None:
+        order.append("dispatch")
+
+    async def sidecar_call(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        order.append(f"ack:{path}:{body['deliveryId']}")
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_dispatch_inbound", dispatch)
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    event = _dm_event("ping", msg_id="acked-1")
+    event["deliveryId"] = "delivery-1"
+
+    await adapter._on_inbound_line(json.dumps(event))
+
+    assert order == ["dispatch", "ack:/ack:delivery-1"]
+
+
+@pytest.mark.asyncio
+async def test_failed_dispatch_is_not_acked_and_releases_dedup_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    calls: list[str] = []
+
+    async def dispatch(_event: dict[str, Any]) -> None:
+        raise RuntimeError("forced dispatch failure")
+
+    async def sidecar_call(path: str, _body: dict[str, Any]) -> dict[str, Any]:
+        calls.append(path)
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_dispatch_inbound", dispatch)
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    event = _dm_event("ping", msg_id="failed-1")
+    event["deliveryId"] = "delivery-failed"
+
+    await adapter._on_inbound_line(json.dumps(event))
+
+    assert calls == []
+    assert adapter._dedup.contains("failed-1") is False
+
+
+@pytest.mark.asyncio
+async def test_failed_dispatch_replays_on_next_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dispatch failure must not consume the message: the next delivery of
+    the same messageId is dispatched (and only then ACKed)."""
+    adapter = _make_adapter(monkeypatch)
+    attempts: list[str] = []
+    acks: list[str] = []
+
+    async def dispatch(_event: dict[str, Any]) -> None:
+        attempts.append("dispatch")
+        if len(attempts) == 1:
+            raise RuntimeError("forced dispatch failure")
+
+    async def sidecar_call(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        acks.append(f"{path}:{body['deliveryId']}")
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_dispatch_inbound", dispatch)
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    first = _dm_event("ping", msg_id="replay-1")
+    first["deliveryId"] = "delivery-replay-1"
+    second = _dm_event("ping", msg_id="replay-1")
+    second["deliveryId"] = "delivery-replay-2"
+
+    await adapter._on_inbound_line(json.dumps(first))
+    await adapter._on_inbound_line(json.dumps(second))
+
+    assert attempts == ["dispatch", "dispatch"]
+    assert acks == ["/ack:delivery-replay-2"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_replay_is_acked_without_reprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duplicate delivery (same messageId, new deliveryId) must be ACKed so
+    the sidecar can advance its cursor, but must not be dispatched twice."""
+    adapter = _make_adapter(monkeypatch)
+    dispatches: list[str] = []
+    acks: list[str] = []
+
+    async def dispatch(_event: dict[str, Any]) -> None:
+        dispatches.append("dispatch")
+
+    async def sidecar_call(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        acks.append(f"{path}:{body['deliveryId']}")
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_dispatch_inbound", dispatch)
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    first = _dm_event("ping", msg_id="dup-ack-1")
+    first["deliveryId"] = "delivery-dup-1"
+    second = _dm_event("ping", msg_id="dup-ack-1")
+    second["deliveryId"] = "delivery-dup-2"
+
+    await adapter._on_inbound_line(json.dumps(first))
+    await adapter._on_inbound_line(json.dumps(second))
+
+    assert dispatches == ["dispatch"]
+    assert acks == ["/ack:delivery-dup-1", "/ack:delivery-dup-2"]
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_delivery_is_not_treated_as_landed_ack(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An /ack reply with ok:true but acknowledged:false (no waiter: sidecar
+    restarted between deliver and ACK, or the waiter timed out) must not be
+    treated as a landed ACK, even though the HTTP call succeeded."""
+    adapter = _make_adapter(monkeypatch)
+    calls: list[str] = []
+
+    async def sidecar_call(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        calls.append(f"{path}:{body['deliveryId']}")
+        return {"ok": True, "acknowledged": False}
+
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+
+    with caplog.at_level("WARNING"):
+        assert await adapter._ack_inbound_delivery("delivery-no-waiter") is False
+    assert calls == ["/ack:delivery-no-waiter"]
+    assert "not acknowledged" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_delivery_returns_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+
+    async def sidecar_call(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "acknowledged": True}
+
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+
+    assert await adapter._ack_inbound_delivery("delivery-ok") is True
+
+
+@pytest.mark.asyncio
 async def test_ndjson_stream_preserves_unicode_line_separators(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

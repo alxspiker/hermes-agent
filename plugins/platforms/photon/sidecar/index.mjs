@@ -61,11 +61,20 @@
 //                          detection so a dead gateway can't orphan us)
 //   PHOTON_TELEMETRY       enable Spectrum SDK telemetry ("true"/"1"/"on"/"yes";
 //                          default off — toggle with `hermes photon telemetry`)
+//   PHOTON_CURSOR_FILE     durable per-stream cursor map; when set, messages
+//                          sent while this process is down are caught up
 
 import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
+import os from "node:os";
+import path from "node:path";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { patchDurableCursors } from "./patch-spectrum-durable-cursors.mjs";
+import {
+  CURSOR_BRIDGE_SYMBOL,
+  createDurableCursorBridge,
+} from "./durable-cursors.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
 import {
   classifyProbeRejection,
@@ -298,6 +307,30 @@ try {
       (e && e.stack ? e.stack : String(e))
   );
 }
+try {
+  const patchResult = patchDurableCursors();
+  if (patchResult.patched) {
+    console.error(
+      `photon-sidecar: Spectrum durable cursor patch applied: ${patchResult.file}`
+    );
+  }
+} catch (e) {
+  console.error(
+    "photon-sidecar: required Spectrum durable cursor patch failed. " +
+      "Run `npm install` inside plugins/platforms/photon/sidecar/ or " +
+      "upgrade the cursor patch for the pinned spectrum-ts version. " +
+      "Original error: " +
+      (e && e.stack ? e.stack : String(e))
+  );
+  process.exit(4);
+}
+
+const hermesHome = process.env.HERMES_HOME || path.join(os.homedir(), ".hermes");
+const cursorFile =
+  process.env.PHOTON_CURSOR_FILE ||
+  path.join(hermesHome, "photon", "inbound-cursors.json");
+const cursorBridge = cursorFile ? createDurableCursorBridge(cursorFile) : null;
+if (cursorBridge) globalThis[CURSOR_BRIDGE_SYMBOL] = cursorBridge;
 let Spectrum,
   imessage,
   attachment,
@@ -333,7 +366,10 @@ const app = await Spectrum({
   projectId,
   projectSecret,
   providers: [imessage.config()],
-  options: { flattenGroups: true },
+  // Keep provider group messages intact: normalizeContent handles them, and a
+  // single wrapper preserves the durable cursor checkpoint through Spectrum's
+  // Object.entries-based extras copy.
+  options: { flattenGroups: false },
   telemetry,
 });
 
@@ -348,6 +384,8 @@ const MESSAGE_EFFECTS = imessage?.effect?.message || {};
 // At most one Python consumer is attached at a time (the gateway adapter).
 let consumerRes = null;
 let consumerWaiters = [];
+const pendingDeliveryAcks = new Map();
+const DELIVERY_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const knownSpaces = new Map();
 // Inbound Message objects by id, so /react can usually skip a
 // `space.getMessage` round trip when tapping back on a recent message.
@@ -428,6 +466,36 @@ async function deliver(line) {
       clearConsumer(res);
     }
   }
+}
+
+function prepareDeliveryAck(deliveryId) {
+  let timer;
+  const acknowledged = new Promise((resolve) => {
+    pendingDeliveryAcks.set(deliveryId, resolve);
+    timer = setTimeout(() => {
+      console.error(
+        `photon-sidecar: delivery ${deliveryId} was not acknowledged within ` +
+          `${DELIVERY_ACK_TIMEOUT_MS}ms; exiting so durable catch-up replays it`
+      );
+      process.exit(75);
+    }, DELIVERY_ACK_TIMEOUT_MS);
+    timer.unref();
+  });
+  return async () => {
+    try {
+      await acknowledged;
+    } finally {
+      clearTimeout(timer);
+      pendingDeliveryAcks.delete(deliveryId);
+    }
+  };
+}
+
+function acknowledgeDelivery(deliveryId) {
+  const resolve = pendingDeliveryAcks.get(deliveryId);
+  if (!resolve) return false;
+  resolve();
+  return true;
 }
 
 async function normalizeBinaryContent(content) {
@@ -705,14 +773,29 @@ function inboundStreamErrorMessage(e) {
         noteInboundYield();
         // Only forward inbound messages (ignore our own outbound echoes).
         if (message && message.direction && message.direction !== "inbound") {
+          cursorBridge?.commitTagged(message);
           continue;
         }
         rememberInboundSpace(space, message);
         rememberKnownMessage(message);
         const event = await normalizeEvent(space, message);
-        if (!event) continue;
+        if (!event) {
+          // Normalize failure is a poison message, not a retryable dispatch
+          // failure: it will fail identically on every replay. Advance past
+          // it, or the cursor stalls here and every restart replays and
+          // re-skips this same message (worst when it is the last message
+          // before a crash). commitTagged is a no-op for untagged messages.
+          cursorBridge?.commitTagged(message);
+          continue;
+        }
+        const needsAck = cursorBridge?.isTagged(message) === true;
+        const deliveryId = needsAck ? crypto.randomUUID() : null;
+        const awaitDeliveryAck = deliveryId ? prepareDeliveryAck(deliveryId) : null;
+        if (deliveryId) event.deliveryId = deliveryId;
         await deliver(JSON.stringify(event));
         await acknowledgeInboundRead(message);
+        if (awaitDeliveryAck) await awaitDeliveryAck();
+        cursorBridge?.commitTagged(message);
       }
       console.error("photon-sidecar: inbound stream ended — re-subscribing");
       markStreamRecovering("inbound stream ended");
@@ -1064,6 +1147,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const body = await readBody(req);
+    if (req.url === "/ack") {
+      const { deliveryId } = body || {};
+      if (typeof deliveryId !== "string" || !deliveryId) {
+        return badRequest(res, "deliveryId is required");
+      }
+      return ok(res, { acknowledged: acknowledgeDelivery(deliveryId) });
+    }
     if (req.url === "/send") {
       const { spaceId, text, format = "text" } = body || {};
       if (!spaceId || typeof text !== "string") {
