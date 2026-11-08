@@ -1217,6 +1217,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         self._voice_clients: dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        # An automation may release only the exact connection it created.
+        # Manual /voice joins revoke that lease, including when moving the bot.
+        self._voice_owners: dict[int, tuple[object, Any]] = {}
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -3753,66 +3756,105 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return False
         guild_id = channel.guild.id
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            existing = self._voice_clients.get(guild_id)
-            if existing and existing.is_connected():
-                if existing.channel.id != channel.id:
-                    await existing.move_to(channel)
-                self._reset_voice_timeout(guild_id)
-                self._bind_voice_text_channel(guild_id, text_channel_id, source)
-                return True
-            vc = await channel.connect()
-            self._voice_clients[guild_id] = vc
+            joined = await self._join_voice_locked(channel, text_channel_id, source)
+            if joined:
+                self._voice_owners.pop(guild_id, None)
+            return joined
+
+    async def join_owned_voice_channel(self, channel, *, owner: object,
+                                       text_channel_id: int | None = None) -> bool:
+        """Atomically claim a *new* connection without moving a manual one.
+
+        Checking _voice_clients outside the guild lock races a manual /voice join:
+        the regular join method will move that existing connection after the
+        automation has already decided the room was empty.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        guild_id = channel.guild.id
+        async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            if guild_id in self._voice_clients:
+                return False
+            joined = await self._join_voice_locked(channel, text_channel_id, None)
+            if joined:
+                self._voice_owners[guild_id] = (owner, self._voice_clients[guild_id])
+            return joined
+
+    async def _join_voice_locked(self, channel, text_channel_id, source) -> bool:
+        """Guild lock held by either the manual or ownership-aware entry point."""
+        guild_id = channel.guild.id
+        existing = self._voice_clients.get(guild_id)
+        if existing and existing.is_connected():
+            if existing.channel.id != channel.id:
+                await existing.move_to(channel)
             self._reset_voice_timeout(guild_id)
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
-            try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
-                receiver.start()
-                self._voice_receivers[guild_id] = receiver
-                self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-                    self._voice_listen_loop(guild_id)
-                )
-            except Exception as e:
-                logger.warning("Voice receiver failed to start: %s", e)
-            # Mixer is best-effort; failure falls back to one-shot FFmpegPCMAudio playback.
-            if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
-                try:
-                    await self._install_voice_mixer(guild_id, vc)
-                except Exception as e:
-                    logger.warning("Voice mixer failed to start: %s", e)
             return True
+        vc = await channel.connect()
+        self._voice_clients[guild_id] = vc
+        self._reset_voice_timeout(guild_id)
+        self._bind_voice_text_channel(guild_id, text_channel_id, source)
+        try:
+            receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+            receiver.start()
+            self._voice_receivers[guild_id] = receiver
+            self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+                self._voice_listen_loop(guild_id)
+            )
+        except Exception as e:
+            logger.warning("Voice receiver failed to start: %s", e)
+        # Mixer is best-effort; failure falls back to one-shot FFmpegPCMAudio playback.
+        if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
+            try:
+                await self._install_voice_mixer(guild_id, vc)
+            except Exception as e:
+                logger.warning("Voice mixer failed to start: %s", e)
+        return True
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            receiver = self._voice_receivers.pop(guild_id, None)
-            pending_inputs = []
-            if receiver:
-                pending_inputs = receiver.flush_pending()
-                receiver.stop()
-            listen_task = self._voice_listen_tasks.pop(guild_id, None)
-            if listen_task:
-                listen_task.cancel()
-            guild = self._client.get_guild(guild_id) if self._client is not None else None
-            captured_for = self._voice_text_channels.get(guild_id)
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data, captured_for)
-            # Tear down the mixer (stops the continuous outgoing stream).
-            if getattr(self, "_voice_mixers", None) is not None:
-                self._voice_mixers.pop(guild_id, None)
-            vc = self._voice_clients.pop(guild_id, None)
-            if vc and vc.is_connected():
-                try:
-                    if vc.is_playing():
-                        vc.stop()
-                except Exception:
-                    pass
-                await vc.disconnect()
-            task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
-                task.cancel()
-            self._voice_text_channels.pop(guild_id, None)
-            self._voice_sources.pop(guild_id, None)
+            await self._leave_voice_locked(guild_id)
+
+    async def leave_owned_voice_channel(self, guild_id: int, *, owner: object) -> None:
+        """Release an automation's exact VoiceClient, never another owner's."""
+        async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            lease = getattr(self, "_voice_owners", {}).get(guild_id)
+            if lease is None or lease[0] is not owner or lease[1] is not self._voice_clients.get(guild_id):
+                return
+            await self._leave_voice_locked(guild_id)
+
+    async def _leave_voice_locked(self, guild_id: int) -> None:
+        """Guild lock held; clear state for every leave path."""
+        self._voice_owners.pop(guild_id, None)
+        receiver = self._voice_receivers.pop(guild_id, None)
+        pending_inputs = []
+        if receiver:
+            pending_inputs = receiver.flush_pending()
+            receiver.stop()
+        listen_task = self._voice_listen_tasks.pop(guild_id, None)
+        if listen_task:
+            listen_task.cancel()
+        guild = self._client.get_guild(guild_id) if self._client is not None else None
+        captured_for = self._voice_text_channels.get(guild_id)
+        for user_id, pcm_data in pending_inputs:
+            if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                await self._process_voice_input(guild_id, user_id, pcm_data, captured_for)
+        if getattr(self, "_voice_mixers", None) is not None:
+            self._voice_mixers.pop(guild_id, None)
+        vc = self._voice_clients.pop(guild_id, None)
+        if vc and vc.is_connected():
+            try:
+                if vc.is_playing():
+                    vc.stop()
+            except Exception:
+                pass
+            await vc.disconnect()
+        task = self._voice_timeout_tasks.pop(guild_id, None)
+        if task:
+            task.cancel()
+        self._voice_text_channels.pop(guild_id, None)
+        self._voice_sources.pop(guild_id, None)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
