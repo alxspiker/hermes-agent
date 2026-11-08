@@ -576,6 +576,13 @@ def _guess_mime(path: str) -> Optional[str]:
 class PhotonAdapter(BasePlatformAdapter):
     """Bidirectional bridge to Photon Spectrum via the Node spectrum-ts sidecar."""
 
+    # Startup auto-resume on this DM channel continues interrupted work instead
+    # of reporting "restored, what next?": Alx uses Photon for long unattended
+    # tasks and wants a restart to auto-continue them. This only affects the
+    # empty-text startup auto-resume turn; a new user message still addresses
+    # that message first via the resume-pending branch.
+    interactive_resume = False
+
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
     SUPPORTS_MESSAGE_EDITING = False  # no edit API: streaming must not leave a stale cursor (▉)
     serial_receive_loop = True  # the /inbound NDJSON loop awaits each line before reading the next
@@ -595,6 +602,7 @@ class PhotonAdapter(BasePlatformAdapter):
         autostart = str(_get_scoped_secret("PHOTON_SIDECAR_AUTOSTART", "true")).lower()
         self._autostart_sidecar = autostart not in ("0", "false", "no")
         self._node_bin = _get_scoped_secret("PHOTON_NODE_BIN") or find_node_executable("node")
+        self._pending_text_by_chat: dict[str, tuple[float, str, str]] = {}
         # Presence watchdog (second layer behind the sidecar's own zombie-stream detection):
         # respawns only when the sidecar's HTTP loop hangs; 10-min interval because shared
         # lines are quiet for hours. Config key wins, then env; None-aware so 0 disables it.
@@ -812,11 +820,44 @@ class PhotonAdapter(BasePlatformAdapter):
             return
         msg_id = event.get("messageId")
         if msg_id and self._dedup.is_duplicate(msg_id):
+            await self._ack_inbound_delivery(event.get("deliveryId"))
             return
         try:
             await self._dispatch_inbound(event)
         except Exception:
+            if msg_id:
+                self._dedup.discard(msg_id)
             logger.exception("[photon] inbound dispatch failed")
+            return
+        await self._ack_inbound_delivery(event.get("deliveryId"))
+
+    async def _ack_inbound_delivery(self, delivery_id: Any) -> bool:
+        """Advance the durable cursor only after inbound dispatch completed.
+
+        Returns True only when the sidecar confirms a waiter resolved
+        (``acknowledged: true``). A reply with ``ok: true`` but
+        ``acknowledged: false`` means no waiter existed — the sidecar
+        restarted between deliver and ACK, or the waiter already timed
+        out — so the cursor must NOT be considered advanced, even though
+        the HTTP call itself succeeded. The same-process dedup + replay
+        path recovers such a message, but only if this is visible, not
+        silently treated as a landed ACK.
+        """
+        if not isinstance(delivery_id, str) or not delivery_id:
+            return False
+        try:
+            data = await self._sidecar_call("/ack", {"deliveryId": delivery_id})
+        except Exception:
+            # No ACK means no cursor advance; a restart replays the event.
+            logger.exception("[photon] failed to acknowledge inbound delivery %s", delivery_id)
+            return False
+        if data.get("acknowledged") is not True:
+            logger.warning(
+                "[photon] inbound delivery %s was not acknowledged by the "
+                "sidecar (no waiter); cursor not advanced, message will replay",
+                delivery_id)
+            return False
+        return True
 
     async def _fffc_timeout_handler(self, chat_key: str, message_id: str) -> None:
         await asyncio.sleep(_FFFC_WAIT_SECONDS)
@@ -867,6 +908,25 @@ class PhotonAdapter(BasePlatformAdapter):
                          "reply_to_is_own_message": is_own}
             content = content["content"]
         ctype = content.get("type")
+
+        # Coalesce iMessage text + bare-URL deliveries that arrive as two events
+        # (common when the link triggers a rich preview card). Merge if the second
+        # is URL-only and within 2s of a pending text in the same chat.
+        if ctype == "text":
+            txt = (content.get("text") or "").strip()
+            url_only = _url_only_candidate(txt)
+            if url_only and space_id in self._pending_text_by_chat:
+                prev_ts, prev_text, prev_mid = self._pending_text_by_chat[space_id]
+                if time.monotonic() - prev_ts < 2.0:
+                    # merge and drop the URL-only event
+                    merged = (prev_text + " " + url_only).strip()
+                    # update the stored pending so later reactions target the right id
+                    self._pending_text_by_chat[space_id] = (prev_ts, merged, prev_mid)
+                    logger.debug("[photon] coalesced text+URL into single message")
+                    return
+            # store non-URL or first-of-pair text for possible merge
+            if not url_only:
+                self._pending_text_by_chat[space_id] = (time.monotonic(), txt, message_id)
 
         def _event(text: str, mtype: MessageType = MessageType.TEXT, **kwargs: Any) -> MessageEvent:
             source = self.build_source(chat_id=space_id, chat_name=space_id, chat_type=chat_type,
@@ -1063,6 +1123,7 @@ class PhotonAdapter(BasePlatformAdapter):
             "PHOTON_PROJECT_ID": self._project_id, "PHOTON_PROJECT_SECRET": self._project_secret,
             "PHOTON_SIDECAR_PORT": str(self._sidecar_port), "PHOTON_SIDECAR_BIND": self._sidecar_bind,
             "PHOTON_SIDECAR_TOKEN": self._sidecar_token,
+            "PHOTON_CURSOR_FILE": str(_runtime_record_path().parent / "photon" / "inbound-cursors.json"),
             # Exit on stdin EOF so ANY gateway death (incl. SIGKILL) can't orphan it on the port.
             "PHOTON_SIDECAR_WATCH_STDIN": "1"})
         from hermes_cli._subprocess_compat import windows_hide_flags  # hide child console on Windows
