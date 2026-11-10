@@ -1,8 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { fetchCatalog, parseCatalog } from './catalog-data'
+import { queryClient } from '@/lib/query-client'
 
-afterEach(() => vi.unstubAllGlobals())
+import { fetchCatalog, parseCatalog, prefetchCatalogWhenIdle } from './catalog-data'
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
 
 describe('public catalog data', () => {
   it('preserves every source and distinct install identifier, including same-named skills', () => {
@@ -141,5 +147,47 @@ describe('public catalog data', () => {
 
   it('rejects a non-catalog response instead of treating an error payload as an empty catalog', () => {
     expect(() => parseCatalog('skills', { error: 'Service unavailable' })).toThrow('Invalid catalog response')
+  })
+})
+
+describe('catalog idle prefetch', () => {
+  it('defers the plugin catalog on browsers without requestIdleCallback', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('requestIdleCallback', undefined)
+    vi.stubGlobal('cancelIdleCallback', undefined)
+    const prefetch = vi.spyOn(queryClient, 'prefetchQuery').mockResolvedValue(undefined)
+
+    const cancel = prefetchCatalogWhenIdle('plugins')
+    expect(prefetch).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1_000)
+    expect(prefetch).toHaveBeenCalledOnce()
+    cancel()
+  })
+
+  it('cancels the fallback when the Capabilities view unmounts', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('requestIdleCallback', undefined)
+    const prefetch = vi.spyOn(queryClient, 'prefetchQuery').mockResolvedValue(undefined)
+
+    const cancel = prefetchCatalogWhenIdle('plugins')
+    cancel()
+    vi.runAllTimers()
+    expect(prefetch).not.toHaveBeenCalled()
+  })
+
+  it('uses and cancels the native idle callback where available', () => {
+    const requestIdle = vi.fn().mockReturnValue(42)
+    const cancelIdle = vi.fn()
+    vi.stubGlobal('requestIdleCallback', requestIdle)
+    vi.stubGlobal('cancelIdleCallback', cancelIdle)
+    const prefetch = vi.spyOn(queryClient, 'prefetchQuery').mockResolvedValue(undefined)
+
+    const cancel = prefetchCatalogWhenIdle('plugins')
+    expect(requestIdle).toHaveBeenCalledWith(expect.any(Function), { timeout: 5_000 })
+    expect(prefetch).not.toHaveBeenCalled()
+    requestIdle.mock.calls[0][0]()
+    expect(prefetch).toHaveBeenCalledOnce()
+    cancel()
+    expect(cancelIdle).toHaveBeenCalledExactlyOnceWith(42)
   })
 })
